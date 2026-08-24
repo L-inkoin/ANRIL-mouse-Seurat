@@ -1,0 +1,1059 @@
+####01-包####
+library(rjson)
+library(limma)   
+library(GEOquery) 
+library(stringr)
+library(survival)
+library(glmnet)
+library(survminer)
+library(timeROC)
+library(data.table)
+library(ggpubr)
+library(dplyr)
+library(patchwork)
+library(Matrix)
+library(readr)
+library(tibble)
+library(ggplot2)
+library(tidyverse) 
+library(future)
+library(pheatmap)
+library(msigdbr)
+library(clusterProfiler)
+library(devtools)
+library(Seurat)
+library(glmGamPoi)
+library(SingleR)
+library(harmony)
+library(DoubletFinder)
+library(copykat)
+library(GSVA)
+library(AUCell)
+library(monocle3)
+library(CellChat)
+library(SCENIC)
+library(RColorBrewer)
+library(hdf5r)
+
+
+
+####02-qc####
+pbmc.data <- Read10X(data.dir = "C:/Users/inkoin/Desktop/ANRIL/A")
+pbmc <- CreateSeuratObject(counts = pbmc.data, 
+                           project = "anril", 
+                           min.cells = 3, min.features = 200)
+
+#查看
+dim(pbmc)
+table(pbmc@meta.data$orig.ident)
+#增加或修改meta.dada信息
+sample_mapping <- c(
+  "1" = "ApoE_ANRIL",
+  "3" = "ApoE_ANRIL",
+  "4" = "ApoE_ANRIL",
+  "2" = "ApoE_",
+  "5" = "ApoE_",
+  "6" = "ApoE_"
+) 
+pbmc@meta.data$orig.ident <- sample_mapping[pbmc@meta.data$orig.ident]
+
+
+
+table(pbmc@meta.data$orig.ident)
+#质量控制
+#线粒体基因比例
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+#红细胞比例
+HB.genes <- c("HBA1","HBA2","HBB","HBD","HBE1","HBG1","HBG2","HBM","HBQ1","HBZ")
+HB.genes <- CaseMatch(HB.genes, rownames(pbmc))
+pbmc[["percent.HB"]]<-PercentageFeatureSet(pbmc, features=HB.genes) 
+0
+
+# 在 pbmc 中添加 log.gene.counts.0 
+pbmc@meta.data$log.gene.counts.0 <- log1p(pbmc@meta.data$nFeature_RNA)  # log1p = log(1 + x)，避免log(0)
+# 添加 z.qc.score
+qc_metrics <- pbmc@meta.data[, c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.HB")]
+pbmc@meta.data$z.qc.score <- scale(qc_metrics) %>% rowMeans(na.rm = TRUE)
+
+#查看相关性
+FeatureScatter(pbmc, "nCount_RNA", "percent.mt", group.by = "orig.ident")
+FeatureScatter(pbmc, "nCount_RNA", "nFeature_RNA", group.by = "orig.ident")
+
+
+#查看质控指标
+#设置绘图元素
+theme.set2 = theme(axis.title.x=element_blank())
+plot.featrures = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.HB")
+group = "orig.ident"
+#质控前小提琴图
+plots = list()
+for(i in c(1:length(plot.featrures))){
+  plots[[i]] = VlnPlot(pbmc, group.by=group, pt.size = 0,
+                       features = plot.featrures[i]) + theme.set2 + NoLegend()}
+violin <- wrap_plots(plots = plots, nrow=2)  
+violin
+#保存
+ggsave("./figs-02/1vlnplot_before_qc.pdf", plot = violin, width = 14, height = 8) 
+dim(pbmc)
+
+
+
+
+#设置质控指标
+quantile(pbmc$nFeature_RNA, seq(0.01, 0.1, 0.01))
+quantile(pbmc$nFeature_RNA, seq(0.9, 1, 0.01))
+#plots[[1]] + geom_hline(yintercept = 500) + geom_hline(yintercept = 4500)
+quantile(pbmc$nCount_RNA, seq(0.01, 0.1, 0.01))
+quantile(pbmc$nCount_RNA, seq(0.9, 1, 0.01))
+#plots[[2]] + geom_hline(yintercept = 22000)
+quantile(pbmc$percent.mt, seq(0.9, 1, 0.01))
+#plots[[3]] + geom_hline(yintercept = 20)
+quantile(pbmc$percent.HB, seq(0.9, 1, 0.01))
+#plots[[4]] + geom_hline(yintercept = 1)
+
+#设置质控标准
+#基因
+minGene=200
+
+#counts
+minUMI=600
+#线粒体
+pctMT=10
+#血细胞
+pctHB=1
+
+#数据质控并绘制小提琴图
+pbmc <- subset(pbmc, subset = nFeature_RNA > minGene  &
+                 nCount_RNA > minUMI & percent.mt < pctMT & percent.HB < pctHB)
+plots = list()
+for(i in seq_along(plot.featrures)){
+  plots[[i]] = VlnPlot(pbmc, group.by=group, pt.size = 0,
+                       features = plot.featrures[i]) + theme.set2 + NoLegend()}
+violin <- wrap_plots(plots = plots, nrow=2)    
+violin
+ggsave("./figs-02/2vlnplot_after_qc.pdf", plot = violin, width = 14, height = 8) 
+saveRDS(pbmc,"./pbmc/1pbmc_qc.rds")
+
+
+####03-doubletFinder####
+#加载
+library(Seurat)
+library(data.table)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(DoubletFinder)
+#读取
+pbmc = readRDS("D:/ANRIL/A/pbmc/1pbmc_qc.rds")
+
+#数据标准化、寻找可变特征、数据缩放
+pbmc = pbmc %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData()
+
+#PCA、UMAP、寻找邻居、聚类
+pbmc = pbmc %>% 
+  RunPCA() %>% 
+  RunUMAP(dims = 1:30) %>%  
+  RunTSNE(dims = 1:30) %>% 
+  FindNeighbors(dims = 1:30) %>% 
+  FindClusters(resolution = 0.1)
+
+#首先获得最佳的pK值
+#pK表示领域大小
+sweep.res.list <- paramSweep(pbmc, PCs = 1:30, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+pk_best = bcmvn %>% 
+  dplyr::arrange(desc(BCmetric)) %>% 
+  dplyr::pull(pK) %>% 
+  .[1] %>% as.character() %>% as.numeric()
+
+#然后估算出双细胞群中，homotypic doublets的比例
+annotations <- pbmc$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)
+print(homotypic.prop)
+
+#双细胞占比为7%左右
+nExp_poi <- round(0.07*nrow(pbmc@meta.data))        
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop)) 
+
+# 默认为0.25
+pbmc <- doubletFinder(pbmc, PCs = 1:30, 
+                      pN = 0.25, pK = pk_best, nExp = nExp_poi.adj, 
+                      reuse.pANN = FALSE, sct = FALSE)
+
+#将列名改为"Double_score"和"Is_Double"
+colnames(pbmc@meta.data)
+
+colnames(pbmc@meta.data)[length(colnames(pbmc@meta.data))-1] <- "Double_score"
+colnames(pbmc@meta.data)[length(colnames(pbmc@meta.data))] <- "Is_Double"
+
+#查看DoubletFinder分析结果
+head(pbmc@meta.data[, c("Double_score", "Is_Double")])
+
+#绘制DoubletFinder分类的tsne图
+DimPlot(pbmc, reduction = "tsne", group.by = "Is_Double")
+
+#绘制双细胞分类的小提琴图
+VlnPlot(pbmc, group.by = "Is_Double", 
+        features = c("nCount_RNA", "nFeature_RNA"), 
+        pt.size = 0, ncol = 2)
+
+#过滤非单细胞数据
+#pbmc <- subset(pbmc, Is_Double == "Singlet")
+
+#保存
+saveRDS(pbmc,"./pbmc/2pbmc_double.rds")
+
+####04-Normalize####
+#读取
+pbmc = readRDS("D:/ANRIL/A/pbmc/2pbmc_double.rds")
+
+#细胞周期评分
+pbmc <- NormalizeData(pbmc)
+
+#获取G2M期相关基因
+g2m_genes <- cc.genes$g2m.genes
+g2m_genes <- CaseMatch(search=g2m_genes, match=rownames(pbmc))
+
+#获取S期相关基因
+s_genes <- cc.genes$s.genes    
+s_genes <- CaseMatch(search=s_genes, match=rownames(pbmc))
+
+#细胞周期阶段评分
+pbmc <- CellCycleScoring(pbmc, g2m.features=g2m_genes, s.features=s_genes)
+
+colnames(pbmc@meta.data)
+table(pbmc$Phase)
+
+#画图
+DimPlot(pbmc,group.by = "Phase",reduction = "tsne")
+
+#保存
+saveRDS(pbmc,"./pbmc/3pbmc_CellCycle.rds")
+
+####05####
+
+
+pbmc = readRDS("D:/ANRIL/A/pbmc/3pbmc_CellCycle.rds")
+
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+
+pbmc <- ScaleData(pbmc,vars.to.regress = c("S.Score", "G2M.Score"))
+#pbmc <- ScaleData(pbmc,vars.to.regress = c("S.Score", "G2M.Score"),features = rownames(pbmc))
+
+# SCT，相当于替代了上述的三个函数NormalizeData，FindVariable，ScaleData
+
+pbmc <- SCTransform(pbmc, vars.to.regress = c("S.Score", "G2M.Score"))
+
+DefaultAssay(pbmc)
+DefaultAssay(pbmc) = "RNA"
+DefaultAssay(pbmc)
+
+DefaultAssay(pbmc) = "SCT"
+DefaultAssay(pbmc)
+
+saveRDS(pbmc,"./pbmc/4pbmc_Normalize.rds")
+
+
+####05-####
+library(clustree)
+
+pbmc = readRDS("D:/ANRIL/A/pbmc/4pbmc_Normalize.rds")
+
+DefaultAssay(pbmc)
+DefaultAssay(pbmc) = "SCT"
+DefaultAssay(pbmc)
+
+table(Idents(pbmc))
+Idents(pbmc) = "orig.ident"
+table(Idents(pbmc))
+
+top10 <- head(VariableFeatures(pbmc), 10)
+
+pdf(file="1.pdf",width=7,height=6)
+VariableFeaturePlot(object = pbmc)
+dev.off()
+
+pdf(file="2.pdf",width=7,height=6)
+LabelPoints(plot = VariableFeaturePlot(object = pbmc), points = top10, repel = TRUE)
+dev.off()
+
+pbmc <- RunPCA(pbmc, verbose = F)
+
+pdf(file="主成分分析.pdf",width=7,height=6)
+DimPlot(object = pbmc, reduction = "pca")
+dev.off()
+
+pdf(file="PCA成分相关基因.pdf",width=10,height=9)
+VizDimLoadings(object = pbmc, dims = 1:4, reduction = "pca",nfeatures = 20)
+dev.off()
+
+pdf(file="主成分分析热图.pdf",width=10,height=9)
+DimHeatmap(object = pbmc, dims = 1:4, cells = 500, balanced = TRUE,nfeatures = 30,ncol=2)
+dev.off()
+
+#选取合适的PC
+pdf(file="elbow.pdf",width=7,height=6)
+ElbowPlot(pbmc, ndims = 50)
+dev.off()
+   
+pct <- pbmc [["pca"]]@stdev / sum( pbmc [["pca"]]@stdev) * 100
+pct
+
+cumu <- cumsum(pct)
+cumu
+
+pcs = 1:40
+
+pbmc <- RunHarmony(pbmc, group.by.vars="orig.ident", assay.use="SCT", max.iter.harmony = 20)
+
+table(pbmc@meta.data$orig.ident)
+
+seq = seq(0.1,2,by=0.1)
+pbmc <- FindNeighbors(pbmc,  dims = pcs) 
+for (res in seq){
+  pbmc = FindClusters(pbmc, resolution = res)
+}
+
+p1 = clustree(pbmc,prefix = "SCT_snn_res.")+coord_flip()
+p = p1+plot_layout(widths = c(3,1))
+ggsave("SCT_sun_res.png", p, width = 30, height = 14)
+
+
+#降维聚类
+pbmc <- FindNeighbors(pbmc, reduction = "pca",  dims = pcs) %>% FindClusters(resolution = 1)
+pbmc <- RunUMAP(pbmc, reduction = "pca",  dims = pcs) %>% RunTSNE(dims = pcs, reduction = "pca")
+
+colnames(pbmc@meta.data)
+#画图
+pdf(file="7.pdf",width=7,height=6)
+DimPlot(pbmc, reduction = "umap", label = T)
+dev.off()
+
+pdf(file="8.pdf",width=7,height=6)
+DimPlot(pbmc,reduction = "umap",label = F,group.by = "orig.ident")
+dev.off()
+
+pdf(file="9.pdf",width=7,height=6)
+DimPlot(pbmc,reduction = "umap",label = F,group.by = "Is_Double")
+dev.off()
+
+pdf(file="10.pdf",width=7,height=6)
+DimPlot(pbmc, reduction = "tsne", label = T)
+dev.off()
+
+pdf(file="11.pdf",width=7,height=6)
+DimPlot(pbmc,reduction = "tsne",label = F,group.by = "orig.ident")
+dev.off()
+
+pdf(file="12.pdf",width=7,height=6)
+DimPlot(pbmc,reduction = "tsne",label = F,group.by = "Is_Double")
+dev.off()
+
+#保存
+saveRDS(pbmc,"./pbmc/5pbmc_UMPA.TSNE.rds")
+
+
+####06-####
+pbmc = readRDS("./pbmc/5pbmc_UMPA.TSNE.rds")
+setwd("./cell")
+setwd("../")
+load("ref_Mouse_all.RData")
+
+testdata = GetAssayData(object = pbmc@assays$RNA, layer = "counts")
+#testdata = GetAssayData(object = pbmc@assays$SCT, layer = "data")
+
+clusters <- pbmc@meta.data$seurat_clusters
+
+table(ref_Mouse@colData@listData[["label.main"]])
+table(ref_Mouse@colData@listData[["label.fine"]])
+
+cellpred <- SingleR(test = testdata, ref = ref_Mouse, clusters = clusters, assay.type.test = "logcounts", 
+                    labels = ref_Mouse@colData@listData[["label.main"]], assay.type.ref = "logcounts")
+
+celltype = data.frame(ClusterID=rownames(cellpred), celltype=cellpred$labels, stringsAsFactors = F)
+
+pbmc@meta.data$SingleR = "NA"
+for(i in 1:nrow(celltype)){
+  pbmc@meta.data[which(pbmc$seurat_clusters == celltype$ClusterID[i]),'SingleR'] <- celltype$celltype[i]
+}
+
+#画图
+p = plotScoreHeatmap(cellpred)
+ggsave("singleR1.pdf", p, width = 12, height = 5)
+
+p1 <- DimPlot(pbmc, group.by = "SingleR", label = T,reduction = "tsne")
+p2 <- DimPlot(pbmc, group.by = "SingleR", label = T,reduction = "umap")
+p <- p1 | p2
+ggsave("singleR2.pdf", p, width = 12, height = 5)
+#保存
+setwd("../")
+saveRDS(pbmc,"./pbmc/6pbmc_SingleR.rds")
+
+####!07-####
+pbmc = readRDS("./pbmc/6pbmc_SingleR.rds")
+setwd("../")
+setwd("./111")
+DefaultAssay(pbmc)
+DefaultAssay(pbmc) = "RNA"
+table(Idents(pbmc))
+#Idents(pbmc) = "nCount_RNA"
+
+#寻找marker
+pbmc.markers1 <- FindAllMarkers(pbmc, only.pos = TRUE,logfc.threshold = 1,)
+write.csv(pbmc.markers1,file="markers.1.SCT.csv")
+
+DefaultAssay(pbmc) = "RNA"
+pbmc.markers2 <- FindAllMarkers(pbmc, only.pos = TRUE,logfc.threshold = 1)
+write.csv(pbmc.markers2,file="markers.2.RNA.csv")
+DefaultAssay(pbmc)
+DefaultAssay(pbmc) = "RNA"
+
+#创建marker集合
+# Markers集合
+markers <- c(
+  "Fgd5", # 内皮细胞（Endothelial cell）
+  "Mrvi1", # 平滑肌细胞（Smooth muscle cell）
+  "Bicc1", #成纤维细胞（Fibroblast
+  "Cd3e", # T细胞（T cell）
+  "Cd68", # 巨噬细胞（Macrophage）
+  "Snap25" # 神经元（Neuron） Y
+)
+# 将markers列表合并为一个字符向量
+markers <- unlist(markers)
+
+
+
+#画图
+p <- FeaturePlot(pbmc, features = markers, ncol = 3)
+ggsave("1.pdf", p, width = 15, height = 10)
+
+p <- DotPlot(pbmc, features = markers) + RotatedAxis()
+ggsave("2.pdf", p, width = 14, height = 6)
+
+p <- VlnPlot(pbmc, features = markers, stack = T, flip = T) + NoLegend()
+ggsave("3.pdf", p, width = 14, height = 6)
+
+
+pdf(file="4.pdf",width=7,height=6)
+DimPlot(pbmc, reduction = "tsne", label = T)
+dev.off()
+
+#第一次
+#immune epithelial stromal
+pbmc$celltype.1 <- recode(pbmc@meta.data$seurat_clusters,
+                          "0" = "Endothelial cells",
+                          "1" = "Macrophages",
+                          "2" = "Adipocytes",
+                          "3" = "Endothelial cells",
+                          "4" = "Endothelial cells",
+                          "5" = "Adipocytes",
+                          "6" = "Fibroblasts",
+                          "7" = "Fibroblasts",
+                          "8" = "Endothelial cells",
+                          "9" = "Fibroblasts",
+                          "10" = "Fibroblasts",
+                          "11" = "Endothelial cells",
+                          "12" = "Adipocytes",
+                          "13" = "Adipocytes",
+                          "14" = "Macrophages",
+                          "15" = "Adipocytes",
+                          "16" = "Adipocytes",
+                          "17" = "Endothelial cells",
+                          "18" = "Fibroblasts",
+                          "19" = "Endothelial cells",
+                          "20" = "Fibroblasts",
+                          "21" = "Fibroblasts",
+                          "22" = "Macrophages",
+                          "23" = "Endothelial cells",
+                          "24" = "Fibroblasts",
+                          "25" = "T cells",
+                          "26" = "Macrophages",
+                          "27" = "Adipocytes",
+                          "28" = "Adipocytes",
+                          "29" = "Endothelial cells",
+                          "30" = "Adipocytes",
+                          "31" = "Fibroblasts",
+                          "32" = "Fibroblasts",
+                          "33" = "Neurons")
+
+#查看各个细胞群的亚型
+table(pbmc@meta.data$celltype.1)
+
+#换个配色
+Biocols = c('#AB3282', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+            '#E95C59', '#E59CC4','#E5D2DD' , '#23452F', '#BD956A', '#8C549C', '#585658',
+            '#9FA3A8', '#E0D4CA', '#5F3D69', '#C5DEBA', '#58A4C3', '#E4C755', '#F7F398',
+            '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+            '#712820', '#DCC1DD', '#CCE0F5',  '#CCC9E6', '#625D9E', '#68A180', '#3A6963',
+            '#968175')
+
+#画图
+p = DimPlot(pbmc, reduction = "umap", label = T,group.by = "celltype.1",cols = Biocols)
+ggsave("umap_1.pdf", p, width = 7, height = 6)
+
+p = DimPlot(pbmc, reduction = "tsne", label = T,group.by = "celltype.1",cols = Biocols)
+ggsave("tsne_1.pdf", p, width = 7, height = 6)
+
+
+
+#第二次
+markers <- list(
+  "Aortic vascular endothelial cells" = c( "Fgd5", "Bmx", "Nos3","Tek","Ptprb","Rasgrf2","Samd12"),
+  "Vascular-associated Macrophage" = c("Cd84", "Dock2", "Ptprc"),
+  "Adventitial Fibroblast" = c("Sparc", "Col1a1", "Fn1"),
+  "Adipocytes" = c("Slc36a2","Mlxipl","Lipe","Prkar2b","Pck1","Scd1", "Nrg4"),
+  "Fibroblasts" = c("Bicc1","Scn7a","Csmd1","Scara5", "Slit3", "Egfr"),
+  "Smooth muscle cells" = c("Mrvi1", "Myh11", "Dtna","Cap2","Unc5c","Ldb3","Npnt"),
+  "Macrophages" = c("Cd68", "Itgam"),
+  "T cells" = c("Cd3e", "Cd4", "Cd8a"),
+  "Memory T cell" = c( "Skap1","Grap2","Arhgap15"),
+  "Neurons" = c("Snap25"),
+  "Schwann cells" = c("Mpz", "Pmp22")
+)
+
+markers <- unlist(markers)
+
+
+
+#画图
+p <- FeaturePlot(pbmc, features = markers, ncol = 3)
+ggsave("6.pdf", p, width = 15, height = 32)
+p <- DotPlot(pbmc, features = markers) + RotatedAxis()
+ggsave("7.pdf", p, width = 14, height = 6)
+p <- VlnPlot(pbmc, features = markers, stack = T, flip = T) + NoLegend()
+ggsave("8.pdf", p, width = 14, height = 6)
+
+pbmc$celltype.main <- recode(pbmc@meta.data$seurat_clusters,
+                             "0" = "Aortic vascular endothelial cells",
+                             "1" = "Vascular-associated Macrophage",
+                             "2" = "Adventitial Fibroblast",
+                             "3" = "Aortic vascular endothelial cells",
+                             "4" = "Aortic vascular endothelial cells",
+                             "5" = "Adipocytes",
+                             "6" = "Fibroblasts",
+                             "7" = "Smooth muscle cells",
+                             "8" = "Aortic vascular endothelial cells",
+                             "9" = "Fibroblasts",
+                             "10" = "Smooth muscle cells",
+                             "11" = "Aortic vascular endothelial cells",
+                             "12" = "Adipocyte",
+                             "13" = "Macrophages",
+                             "14" = "Macrophages",
+                             "15" = "Adipocyte",
+                             "16" = "Macrophages",
+                             "17" = "Aortic vascular endothelial cells",
+                             "18" = "Fibroblasts",
+                             "19" = "Aortic vascular endothelial cells",
+                             "20" = "Aortic vascular endothelial cells",
+                             "21" = "Smooth muscle cells",
+                             "22" = "T cells",
+                             "23" = "Aortic vascular endothelial cells",
+                             "24" = "Smooth muscle cells",
+                             "25" = "Memory T cell",
+                             "26" = "Smooth muscle cells",
+                             "27" = "Smooth muscle cells",
+                             "28" = "Fibroblasts",
+                             "29" = "Aortic vascular endothelial cells",
+                             "30" = "30",
+                             "31" = "Schwann cells",
+                             "32" = "Neurons",
+                             "33" = "Neurons")
+
+
+#查看各个细胞群的亚型
+table(pbmc@meta.data$celltype.main)
+#画图
+p = DimPlot(pbmc, reduction = "umap", label = T,group.by = "celltype.main")
+ggsave("umap_main.pdf", p, width = 7, height = 6)
+p = DimPlot(pbmc, reduction = "tsne", label = T,group.by = "celltype.main")
+ggsave("tsne_main.pdf", p, width = 7, height = 6)
+
+p1 = DimPlot(pbmc, reduction = "umap", label = T,group.by = "celltype.main")
+p2 = DimPlot(pbmc, reduction = "umap", label = T,group.by = "celltype.1")
+ggsave("umap_2.pdf", p1|p2, width = 15, height = 6)
+
+p1 = DimPlot(pbmc, reduction = "tsne", label = T,group.by = "celltype.main")
+p2 = DimPlot(pbmc, reduction = "tsne", label = T,group.by = "celltype.1")
+ggsave("tsne_2.pdf", p1|p2, width = 15, height = 6)
+
+
+#分组
+table(Idents(pbmc))
+Idents(pbmc) = "celltype.main"
+table(Idents(pbmc))
+
+#矩阵
+DefaultAssay(pbmc)
+
+#寻找每个细胞类型的markers
+pbmc.markers3 <- FindAllMarkers(pbmc, only.pos = TRUE,logfc.threshold = 1,min.pct = 0.3)
+write.csv(pbmc.markers3,file="markers.celltype.RNA.csv")
+
+#提取前10的marker
+top10 <- pbmc.markers3 %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+#对这些基因进行scaledata
+markers = as.data.frame(top10[,"gene"])
+pbmc <- ScaleData(pbmc, features = as.character(unique(markers$gene)))
+
+#画图
+p = DoHeatmap(pbmc,
+              features = as.character(unique(markers$gene)),
+              group.by = "celltype.main")
+ggsave("15.pdf", p, width = 10, height = 9)
+
+#每个细胞亚群抽最少的细胞类型
+allCells = names(Idents(pbmc))
+allType = levels(Idents(pbmc))
+choose_Cells = unlist(lapply(allType, function(x){
+  cgCells = allCells[Idents(pbmc)== x ]
+  cg=sample(cgCells,min(table(pbmc@meta.data$celltype.main)))
+  cg
+}))
+
+#提取
+cg_sce = pbmc[, allCells %in% choose_Cells]
+table(Idents(cg_sce))
+
+#画图
+p = DoHeatmap(cg_sce,
+              features = as.character(unique(markers$gene)),
+              group.by = "celltype.main")
+ggsave("16.pdf", p, width = 10, height = 9)
+
+
+
+
+#堆叠柱状图
+cell.prop<-as.data.frame(prop.table(table(pbmc@meta.data$celltype.main, pbmc@meta.data$orig.ident)))
+colnames(cell.prop)<-c("cluster","group","proportion")
+
+p = ggplot(cell.prop,aes(group,proportion,fill=cluster))+
+  geom_bar(stat="identity",position="fill")+
+  ggtitle("")+
+  theme_bw()+
+  theme(axis.ticks.length=unit(0.5,'cm'))+
+  guides(fill=guide_legend(title=NULL))
+ggsave("17.pdf", p, width = 10, height = 9)
+
+#保存
+saveRDS(pbmc,"./pbmc/7pbmc_celltype.rds")
+
+
+####细胞亚群(不做)####
+library(SingleR)
+library(celldex)
+#提取细胞类型进行细分亚群定义
+pbmc.T = pbmc[, Idents(pbmc) %in% c("T cells")]
+
+
+
+macrophage_expr <- as.matrix(GetAssayData(pbmc_macrophages, slot = "data"))
+
+ref_data <- MouseMacrophageData()
+
+predictions <- SingleR(test = macrophage_expr, ref = ref_data, labels = ref_data$label.main)
+
+pbmc_macrophages$subclass <- predictions$labels
+pbmc@meta.data$subclass[macrophage_cells] <- pbmc_macrophages$subclass
+
+
+
+####08####
+library(MAST)
+library(dplyr)
+library(scrattch.hicat)
+library(data.table)
+
+
+pbmc = readRDS("./pbmc/7pbmc_celltype.rds")
+pbmc@meta.data <- pbmc@meta.data %>%
+  rename(subclass = celltype.main)
+
+
+norm.dat <- as.matrix(GetAssayData(pbmc, assay = "RNA", slot = "data"))
+#norm.dat <- GetAssayData(pbmc, assay = "RNA", slot = "data")：
+#norm.dat <- as.matrix(norm.dat)  
+
+anno.df <- pbmc@meta.data
+anno.df$sample_id <- rownames(anno.df) 
+stopifnot(all(c("orig.ident") %in% colnames(anno.df)))
+
+split.by <- "orig.ident" 
+source("C:/Users/inkoin/Desktop/ANRIL/analysis_functions.R")
+
+
+anno.df$gene.counts.0 <- pbmc@meta.data$nFeature_RNA
+
+
+anno.df$gene.counts.0 <- anno.df$gene.counts.0 + 1e-5
+
+result <- get_age_degenes_mast(
+  anno.df = anno.df,
+  norm.dat = norm.dat,
+  group1 = "ApoE_", 
+  group2 = "ApoE_ANRIL",
+  split.by = "orig.ident",
+  maxcells = 500,
+  freq_expressed = 0.01
+)
+
+
+
+head(result$result)
+
+saveRDS(result, file = "/pbmc/MAST_analysis_result.rds")
+
+write.csv(result$result, file = "./MAST/MAST_analysis_result.csv", row.names = FALSE)
+####09-####
+library(ggplot2)
+library(dplyr)
+result <- readRDS("MAST_analysis_result.rds")
+
+load("C:/Users/inkoin/Desktop/单细胞数据挖掘(1)/test/sex.genes.rda")        # 性别偏向基因
+load("C:/Users/inkoin/Desktop/单细胞数据挖掘(1)/test/genotype.genes.rda")   # 基因型偏向基因
+genes.exclude <- c(sex.genes, genotype.genes)
+
+fcthreshold <- 1    # fold change阈值
+pthreshold <- 0.01  # p值阈值
+
+de.results <- result
+
+de.results.filtered <- de.results %>%
+  filter(p_val_adj < pthreshold & abs(avg_log2FC) > fcthreshold) %>% 
+  filter(!gene %in% genes.exclude) %>%  
+  arrange(desc(avg_log2FC))
+
+subclass.results <- de.results.filtered %>%
+  group_by(subclass) %>%
+  summarise(de.gene.count = n()) %>%
+  ungroup()
+
+saveRDS(subclass.results, file = "subclasswide_degene_summary_pcut0.01_fc1_excludedgenes.rds")
+saveRDS(de.results.filtered, file = "de.results.long_pcut0.01_fc1.rds")
+
+if (!all(c("subclass_label", "class_color", "class_label") %in% colnames(anno.df))) {
+ 
+  anno.df$subclass_label <- anno.df$celltype.main
+  
+  anno.df$class_label <- anno.df$celltype.main
+  
+ 
+  unique_subclasses <- unique(anno.df$subclass_label)
+  
+  color_palette <- c(
+    "Aortic vascular endothelial cells" = "#E95C59",
+    "Vascular-associated Macrophage" = "#E39A35",
+    "Adventitial Fibroblast" = "#AA9A59",
+    "Adipocytes" = "#984EA3",
+    "Fibroblasts" = "#53A85F",
+    "Smooth muscle cells" = "#FFFF33",
+    "Macrophages" = "#F781BF",
+    "T cells" = "#999999",
+    "Memory T cell" = "#66C2A5",
+    "Schwann cells" = "#8DA0CB",
+    "Neurons" = "#E78AC3",
+    "Adipocyte" = "#A65628",
+    "30" = "#FC8D62"
+  )
+  
+  
+  missing_colors <- setdiff(unique_subclasses, names(color_palette))
+  if (length(missing_colors) > 0) {
+    warning("以下类别在颜色向量中缺少对应的颜色: ", paste(missing_colors, collapse = ", "))
+    default_color <- "#999999"  # 灰色作为默认颜色
+    additional_colors <- setNames(rep(default_color, length(missing_colors)), missing_colors)
+    color_palette <- c(color_palette, additional_colors)
+  }
+  
+ 
+  anno.df$class_color <- color_palette[match(anno.df$subclass_label, names(color_palette))]
+}
+
+
+tmp <- unique(anno.df[, c("subclass_label", "class_color", "class_label")])
+
+
+subclass.results1 <- left_join(subclass.results, tmp, by = c("subclass" = "subclass_label")) %>%
+  arrange(subclass)
+
+
+subclass.results1$subclass <- factor(subclass.results1$subclass, 
+                                     levels = unique(anno.df$subclass_label))
+
+p1 <- ggplot(subclass.results1, aes(y = de.gene.count, x = subclass, fill = subclass)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = unique(tmp$class_color)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  ) +
+  labs(title = "Number of Differentially Expressed Genes per Subclass",
+       x = "Subclass", y = "Gene Count")
+
+
+de.results.long <- de.results.filtered %>%
+  mutate(
+    subclass = factor(subclass, levels = unique(anno.df$subclass_label)),
+    direction = ifelse(avg_log2FC < 0, "negative", "positive"),  =
+    abs.coef = abs(avg_log2FC)
+  )
+
+
+p2 <- ggplot(de.results.long, aes(x = subclass, y = abs.coef, color = subclass, shape = direction)) +
+  geom_jitter(size = 1.5, width = 0.1, alpha = 0.6) +
+  scale_color_manual(values = unique(tmp$class_color)) +
+  scale_shape_manual(values = c(16, 1)) +  # 使用实心圆和空心圆
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  ) +
+  labs(title = "Effect Size of Differentially Expressed Genes",
+       x = "Subclass", y = "Absolute Coefficient")
+
+
+p4 <- ggplot(de.results.long, aes(x = subclass, y = -log10(p_val_adj), color = subclass)) +
+  geom_jitter(size = 1.5, width = 0.1, alpha = 0.6) +
+  scale_color_manual(values = unique(tmp$class_color)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  ) +
+  labs(title = "Significance of Differentially Expressed Genes",
+       x = "Subclass", y = "-log10(Adjusted p-value)")
+
+
+p3 <- ggplot(subclass.results1, aes(y = de.gene.count, x = subclass, fill = subclass)) +
+  geom_col(width = 0.8) +
+  geom_jitter(data = de.results.long, 
+              aes(x = subclass, y = -30*abs.coef, color = subclass, shape = direction),
+              size = 1.5, width = 0.1, alpha = 0.6) +
+  scale_fill_manual(values = unique(tmp$class_color)) +
+  scale_color_manual(values = unique(tmp$class_color)) +
+  scale_shape_manual(values = c(16, 1)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  ) +
+  labs(title = "Combined View: Gene Count and Effect Size",
+       x = "Subclass", y = "Gene Count / Effect Size")
+
+
+ggsave(p1, filename = "barplot_ndegene_level1color_pcut0.01_fc1.pdf", 
+       useDingbats = FALSE, width = 14, height = 6, dpi = 300)
+ggsave(p2, filename = "dotplot_signifcoef_level1color_pcut0.01_fc1.pdf", 
+       useDingbats = FALSE, width = 14, height = 6, dpi = 300)
+ggsave(p4, filename = "dotplot_signifpval_level1color_pcut0.01_fc1.pdf", 
+       useDingbats = FALSE, width = 14, height = 6, dpi = 300)
+ggsave(p3, filename = "combdotbar_level1color_pcut0.01_fc1.pdf", 
+       useDingbats = FALSE, width = 14, height = 6, dpi = 300)
+
+####10-####
+# 从Seurat对象获取metadata
+meta <- pbmc@meta.data
+
+# 1. 按cluster统计各年龄组细胞数
+cluster_counts <- meta %>%
+  group_by(seurat_clusters, orig.ident) %>%
+  summarise(n = n()) %>%
+  pivot_wider(names_from = orig.ident, values_from = n, values_fill = 0)
+
+# 2. 计算每个cluster的Odds Ratio
+calc_odds_ratio <- function(df) {
+  total_adult <- sum(df$ApoE_, na.rm = TRUE)       # 对照组总数
+  total_aged <- sum(df$ApoE_ANRIL, na.rm = TRUE)   # 实验组总数
+  
+  df %>%
+    mutate(
+      a = ApoE_ANRIL,         # 实验组在该cluster的细胞数
+      b = ApoE_,              # 对照组在该cluster的细胞数
+      c = total_aged - a,     # 实验组不在该cluster的细胞数
+      d = total_adult - b,    # 对照组不在该cluster的细胞数
+      OR = (a/c)/(b/d),
+      log2OR = log2(OR)
+    )
+}
+
+cluster_or <- calc_odds_ratio(cluster_counts)
+
+# 修正后的亚群注释信息整合
+# 添加celltype.main注释 - 使用as.character()处理因子变量
+cluster_annot <- meta %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    supertype = as.character(unique(celltype.main)[1]),
+    subclass = as.character(unique(celltype.1)[1])
+  )
+
+# 现在可以正常合并数据
+cluster_data <- cluster_or %>%
+  left_join(cluster_annot, by = "seurat_clusters")
+
+library(ggplot2)
+
+# 假设 cluster_data 数据框已经正确加载并包含必要的列
+threshold <- 1  # 设置阈值，根据您的数据调整
+
+custom_colors <- scale_fill_gradient2(
+  low = "#2166AC",  # 深蓝色（冷色，负值）
+  mid = "#F7F7F7",  # 亮灰色（中性色）
+  high = "#B2182B", # 深红色（暖色，正值）
+  midpoint = 0,
+  limits = c(-5, 5),
+  name = expression(log[2]~"(Odds Ratio)"),
+  oob = scales::squish  # 处理超出范围值的策略
+)
+
+# 调整后的绘图代码
+ggplot(cluster_data, aes(x = log2OR, y = supertype)) +
+  geom_vline(xintercept = c(-threshold, threshold), 
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_point(
+    aes(size = ApoE_ANRIL + ApoE_, fill = log2OR),
+    shape = 21, 
+    color = "black",        # 添加黑色边框增强轮廓
+    alpha = 0.85,           # 微调透明度
+    stroke = 0.4            # 边框粗细
+  ) +
+  custom_colors +
+  scale_size_continuous(
+    range = c(2, 10),
+    breaks = c(500, 2000, 4000),  # 明确标注关键规模断点
+    labels = scales::comma
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(x = expression(log[2]~"(Odds Ratio)"), y = "Cell Supertype") +
+  theme(
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "right",
+    axis.text = element_text(color = "black")
+  )
+
+####11####
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+# 加载数据
+pbmc <- readRDS("./pbmc/pbmc.rds")
+de.results.filtered <- readRDS("./MAST/de.results.long_pcut0.01_fc1.rds")
+setwd("FIG3/1")
+
+target_subclasses <- c(
+  "Macrophages",
+  "Adipocytes",
+  "Adventitial Fibroblast",
+  "Aortic vascular endothelial cells"
+)
+
+# 预定义marker基因
+marker_genes <- list(
+  "Macrophages" = c( "Adgre1", "Csf1r", "Mertk"),
+  "Adipocytes" = c("Slc36a2","Mlxipl","Lipe","Prkar2b","Pck1","Scd1", "Nrg4"),
+  "Adventitial Fibroblast" = c("Sparc", "Col1a1", "Fn1"),
+  "Aortic vascular endothelial cells" = c( "Fgd5", "Bmx", "Nos3","Tek","Ptprb","Rasgrf2","Samd12")
+)
+markers <- list(
+  "Aortic vascular endothelial cells" = c( "Fgd5", "Bmx", "Nos3","Tek","Ptprb","Rasgrf2","Samd12"),
+  "Vascular-associated Macrophage" = c("Cd84", "Dock2", "Ptprc"),
+  "Adventitial Fibroblast" = c("Sparc", "Col1a1", "Fn1"),
+  "Adipocytes" = c("Slc36a2","Mlxipl","Lipe","Prkar2b","Pck1","Scd1", "Nrg4"),
+  "Fibroblasts" = c("Bicc1","Scn7a","Csmd1","Scara5", "Slit3", "Egfr"),
+  "Smooth muscle cells" = c("Mrvi1", "Myh11", "Dtna","Cap2","Unc5c","Ldb3","Npnt"),
+  "Macrophages" = c("Cd68", "Itgam"),
+  "T cells" = c("Cd3e", "Cd4", "Cd8a"),
+  "Memory T cell" = c( "Skap1","Grap2","Arhgap15"),
+  "Neurons" = c("Snap25"),
+  "Schwann cells" = c("Mpz", "Pmp22")
+)
+
+for (cell_type in target_subclasses) {
+
+  subset_seurat <- subset(pbmc, subset = celltype.main == cell_type)
+  
+
+  de_genes <- de.results.filtered %>%
+    filter(subclass == cell_type) %>%
+    arrange(desc(avg_log2FC)) %>%
+    pull(gene)
+  
+  
+  top_heatmap_genes <- head(de_genes, 10)
+  
+  
+  p_heatmap <- DoHeatmap(subset_seurat,
+                         features = top_heatmap_genes,
+                         group.by = "orig.ident",
+                         group.colors = c("ApoE_" = "#2C7BB6", "ApoE_ANRIL" = "#D7191C"),
+                         slot = "data") +  # 使用RNA assay的标准化数据
+    scale_fill_gradientn(colors = c("#313695", "#ffffbf", "#d73027")) +
+    labs(title = paste(cell_type, "Differential Genes Heatmap")) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  ggsave(paste0(cell_type, "_heatmap.pdf"), 
+         p_heatmap, 
+         width = 10, 
+         height = 6)
+  
+  
+  current_markers <- marker_genes[[cell_type]]
+  
+  
+  valid_markers <- current_markers[current_markers %in% rownames(subset_seurat)]
+  
+  if (length(valid_markers) > 0) {
+    p_vln <- VlnPlot(subset_seurat,
+                     features = valid_markers,
+                     group.by = "orig.ident",
+                     pt.size = 0,
+                     ncol = length(valid_markers),
+                     combine = FALSE)
+    
+    
+    combined_vln <- wrap_plots(p_vln, ncol = 1) +
+      plot_annotation(title = paste(cell_type, "Marker Genes Expression")) &
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    ggsave(paste0(cell_type, "_violin.pdf"),
+           combined_vln,
+           width = 8,
+           height = 4 * length(valid_markers))
+  }
+}
+
+
+## Augur分析
+
+load("anno.df.clean_cluster0916_v231221_20231221.rda")  # 加载注释数据
+load("subclasswide_degene_summary_pcut0.01_fc1_excludedgenes.rds")  # 加载包含在MAST分析中的亚类
+
+anno.df.select = anno.df[anno.df$sample_id %in% colnames(norm.dat),]
+anno.df.select = anno.df.select[anno.df.select$subclass %in% subclasswide_degene_summary_pcut0.01_fc1_excludedgenes$subclass,]
+anno.df.select$subclass = as.character(anno.df.select$subclass)
+min(table(anno.df.select$subclass, anno.df.select$cat))
+
+meta.df = anno.df.select[,c("subclass", "cat")]
+row.names(meta.df) = anno.df.select$sample_id
+norm.dat.select = norm.dat[,row.names(meta.df)]
+augur = calculate_auc(norm.dat.select, meta.df, cell_type_col = "subclass", label_col = "cat", 
+                      feature_perc = 0.8, var_quantile = 0.9, subsample_size = 200,
+                      n_threads = 25)
+
+saveRDS(augur, file = "Augur/augur_result.rds")
+
+augur = readRDS("Augur/augur.result.rds")
+rank.all = augur$AUC
+aucresults.all = augur$results
+save(rank.all, aucresults.all, file = "Augur/augur.objects_allcells.rda")
